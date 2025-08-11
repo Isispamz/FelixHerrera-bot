@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import bodyParser from 'body-parser';
-import { handleIncoming } from './src/intentRouter.js';
+import { handleIncoming } from './intentRouter.js;
 
 const app = express();
 app.use(bodyParser.json());
