@@ -1,3 +1,13 @@
+'use strict';
+
+/**
+ * intentRouter.js — Router principal (ES) con tono Alfred + JARVIS
+ * - Normaliza payloads del webhook de WhatsApp (Meta)
+ * - Crea eventos en iCloud con lenguaje natural
+ * - Guarda adjuntos en OneDrive (si viene el buffer)
+ * - Inicia click-to-call vía Twilio
+ */
+
 const dayjs = require('dayjs');
 const customParseFormat = require('dayjs/plugin/customParseFormat');
 dayjs.extend(customParseFormat);
@@ -6,7 +16,7 @@ dayjs.locale('es');
 const chrono = require('chrono-node');
 const { t } = require('./persona');
 
-// Soporta export default o export nombrado en los módulos locales:
+// Permitir que los módulos locales exporten default o funciones nombradas
 const sendMod = require('./send');
 const sendText = sendMod.sendText || sendMod;
 
@@ -18,11 +28,12 @@ const uploadBufferToOneDrive = onedriveMod.uploadBufferToOneDrive || onedriveMod
 
 const twilioMod = require('./twilio');
 const startClickToCall = twilioMod.startClickToCall || twilioMod;
-// intentRouter.js — Router principal (ES) con tono Alfred + JARVIS
-// ---------------------------------------------------------------
+
 // ---------------------- helpers ----------------------
 
-function pad(n){ return String(n).padStart(2,'0'); }
+function pad(n) {
+  return String(n).padStart(2, '0');
+}
 
 function toDateSafe(d) {
   // acepta Date, dayjs, string; regresa Date o null
@@ -34,23 +45,23 @@ function toDateSafe(d) {
   return isNaN(asDate) ? null : asDate;
 }
 
-/** Duración en minutos desde texto español/mixto */
+// Duración en minutos desde texto español/mixto
 function parseDurationText(input) {
   if (!input) return 60; // default
-  const s = String(input).toLowerCase().replace(/\s+/g,' ').trim();
+  const s = String(input).toLowerCase().replace(/\s+/g, ' ').trim();
 
-  // formatos tipo "1h30", "1:30h", "1.5h", "90m"
   let m;
+  // "1h30", "1:30h", "1.5h", "90m"
   if ((m = s.match(/(\d+(?:[.,]\d+)?)\s*h(?:oras?)?\s*(\d+)\s*m?/))) {
     const h = parseFloat(m[1].replace(',', '.'));
     const min = parseInt(m[2], 10) || 0;
-    return Math.round(h*60 + min);
+    return Math.round(h * 60 + min);
   }
   if ((m = s.match(/(\d+)\s*[:.]\s*(\d+)\s*h/))) {
-    return Math.round(parseInt(m[1],10)*60 + parseInt(m[2],10));
+    return Math.round(parseInt(m[1], 10) * 60 + parseInt(m[2], 10));
   }
   if ((m = s.match(/(\d+(?:[.,]\d+)?)\s*h(?:oras?)?/))) {
-    return Math.round(parseFloat(m[1].replace(',', '.'))*60);
+    return Math.round(parseFloat(m[1].replace(',', '.')) * 60);
   }
   if ((m = s.match(/(\d+)\s*m(?:in(?:utos?)?)?/))) {
     return parseInt(m[1], 10);
@@ -60,19 +71,18 @@ function parseDurationText(input) {
   if (/\bmedia ?hora\b/.test(s)) return 30;
   if (/\bhora y media\b/.test(s)) return 90;
   if (/\buna hora\b/.test(s)) return 60;
-  if (/\bun[a]?\s*\d{0}\s*hora[s]?\b/.test(s)) return 60;
 
   // "2 horas", "3 horas y 15"
   if ((m = s.match(/(\d+)\s*horas?(?:\s*y\s*(\d+)\s*min)?/))) {
-    const h = parseInt(m[1],10);
-    const min = m[2] ? parseInt(m[2],10) : 0;
-    return h*60 + min;
+    const h = parseInt(m[1], 10);
+    const min = m[2] ? parseInt(m[2], 10) : 0;
+    return h * 60 + min;
   }
 
   return 60;
 }
 
-/** Extrae lugar a partir de "en <lugar>" o "@lugar" al final */
+// Extrae lugar a partir de "en <lugar>" o "@lugar" al final
 function extractLocation(text) {
   if (!text) return '';
   let m = text.match(/(?:\b(?:en)\s+)([^,;]+)$/i);
@@ -82,7 +92,7 @@ function extractLocation(text) {
   return '';
 }
 
-/** Intenta inferir título eliminando fecha/hora/duración/lugar conocidos */
+// Intenta inferir título quitando fecha/hora/duración/lugar conocidos
 function inferTitle(raw, { when, minutes, location }) {
   let title = String(raw || '').trim();
 
@@ -98,55 +108,79 @@ function inferTitle(raw, { when, minutes, location }) {
     .replace(/\bmedia ?hora\b/ig, '')
     .replace(/\bhora y media\b/ig, '');
 
-  // quita fecha/hora reconocible simple (no perfecto, pero ayuda)
+  // quita fecha/hora muy comunes
   title = title
     .replace(/\b(hoy|mañana|pasado mañana)\b/ig, '')
     .replace(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g, '')
     .replace(/\b\d{1,2}\s*(?:am|pm|hrs?|h)\b/ig, '')
     .replace(/\b\d{2}:\d{2}\b/g, '')
     .replace(/\s{2,}/g, ' ')
-    .replace(/[,\s]+$/,'');
+    .replace(/[,\s]+$/, '');
 
-  // si quedó vacío, título genérico
   if (!title) title = 'Evento';
-
   return title;
 }
 
-/** Usa chrono-node para fecha/hora en español */
+// Usa chrono-node para fecha/hora en español
 function parseWhen(text) {
   const ref = new Date();
-  // forwardDate: fechas pasadas se mandan al futuro (siguiente ocurrencia)
-  const dt = chrono.parseDate(text, ref, { forwardDate: true });
-  return toDateSafe(dt);
+  try {
+    // forwardDate: fechas pasadas se mandan al futuro (siguiente ocurrencia)
+    const dt = chrono.parseDate(text, ref, { forwardDate: true });
+    return toDateSafe(dt);
+  } catch (_) {
+    return null;
+  }
+}
+
+// Normaliza payload del webhook: crudo de Meta -> mensaje "plano"
+function normalizeIncoming(payload) {
+  // Si ya parece plano, regresa tal cual
+  if (payload && (payload.from || payload.type || payload.text)) return payload;
+
+  // Forma cruda de WhatsApp Cloud API
+  try {
+    const entry = payload?.entry?.[0];
+    const value = entry?.changes?.[0]?.value;
+    const msg0 = value?.messages?.[0];
+    if (msg0) return msg0;
+  } catch (_) {}
+
+  return payload || {};
+}
+
+// Obtiene texto desde varios tipos de mensaje (text, button, interactive)
+function extractBody(m) {
+  return (
+    (m.text && m.text.body) ||
+    (m.button && m.button.text) ||
+    (m.interactive && m.interactive?.button_reply?.title) ||
+    (m.interactive && m.interactive?.list_reply?.title) ||
+    m.body ||
+    ''
+  );
 }
 
 // ---------------------- router ----------------------
 
-/**
- * Maneja un mensaje entrante desde el webhook de WhatsApp.
- * Espera un objeto `msg` similar al de Meta:
- *  - msg.from : número del usuario
- *  - msg.type : 'text' | 'image' | 'document' | ...
- *  - msg.text?.body : texto
- *  - msg.document / msg.image ... (si aplica)
- */
 async function handleIncoming(msg) {
-  try {console.log('[webhook] incoming:', {
-  from: msg?.from || msg?.sender || msg?.phone_number,
-  type: msg?.type,
-  hasText: !!(msg?.text?.body || msg?.body)
-});
-    const from = msg.from || msg.phone_number || msg.sender;
-    const body =
-      (msg.text && msg.text.body) ||
-      (msg.button && msg.button.text) ||
-      (msg.interactive && msg.interactive?.button_reply?.title) ||
-      (msg.body) ||
-      '';
+  try {
+    const m = normalizeIncoming(msg);
 
+    const from = m.from || m.phone_number || m.sender || '';
+    const body = extractBody(m);
     const text = String(body || '').trim();
     const low = text.toLowerCase();
+
+    console.log('[webhook] incoming:', {
+      from,
+      type: m?.type,
+      hasText: !!text,
+      preview: text.slice(0, 60)
+    });
+
+    // si no hay remitente, no podemos responder
+    if (!from) return;
 
     // Saludo / ayuda rápida
     if (!text) {
@@ -154,7 +188,7 @@ async function handleIncoming(msg) {
       return;
     }
 
-    if (['hola','buenas','hey','menu','ayuda','help'].includes(low)) {
+    if (['hola', 'buenas', 'hey', 'menu', 'ayuda', 'help'].includes(low)) {
       await sendText(from, t('generic_help'));
       return;
     }
@@ -165,45 +199,52 @@ async function handleIncoming(msg) {
       return;
     }
 
-    // Intent: llamada (muy básico: "llama a 555..." / "marcar 55...")
+    // Intent: llamada simple: "llama al 55 1234 5678"
     if (/\b(llama|marc[ae]r?)\b/.test(low)) {
-      const num = (text.match(/(\+?\d[\d\s-]{6,})/) || [])[1];
+      const numMatch = text.match(/(\+?\d[\d\s-]{6,})/);
+      const num = numMatch ? numMatch[1] : null;
       if (num) {
         try {
-          await startClickToCall(num.replace(/\D/g,''));
+          await startClickToCall(num.replace(/\D/g, ''));
           await sendText(from, t('calling', num));
         } catch (err) {
+          console.error('[clickToCall] error:', err?.message);
           await sendText(from, 'No fue posible iniciar la llamada ahora mismo.');
         }
       } else {
-        await sendText(from, 'Indíqueme a qué número desea llamar (por ejemplo: "llama al 55 1234 5678").');
+        await sendText(
+          from,
+          'Indíqueme a qué número desea llamar (por ejemplo: "llama al 55 1234 5678").'
+        );
       }
       return;
     }
 
-    // Intent: adjuntos -> OneDrive (si tu server ya descarga el buffer)
-    if (['image','document','audio','video'].includes(msg.type)) {
-      // Tu server debe haber puesto msg.mediaBuffer / msg.filename si ya descargó el archivo.
-      if (msg.mediaBuffer && msg.filename) {
+    // Adjuntos -> OneDrive (si tu server ya descargó el archivo y puso mediaBuffer/filename)
+    if (['image', 'document', 'audio', 'video'].includes(m.type)) {
+      if (m.mediaBuffer && m.filename) {
         try {
-          const savedPath = await uploadBufferToOneDrive(msg.mediaBuffer, msg.filename);
-          await sendText(from, t('file_saved', savedPath || msg.filename));
+          const savedPath = await uploadBufferToOneDrive(m.mediaBuffer, m.filename);
+          await sendText(from, t('file_saved', savedPath || m.filename));
         } catch (err) {
+          console.error('[onedrive] error:', err?.message);
           await sendText(from, 'No logré guardar el archivo en OneDrive en este momento.');
         }
       } else {
-        await sendText(from, 'Puedo guardar sus archivos en OneDrive; envíelos de nuevo y me encargo.');
+        await sendText(
+          from,
+          'Puedo guardar sus archivos en OneDrive; envíelos de nuevo y me encargo.'
+        );
       }
       return;
     }
 
-    // -------- Intent: crear evento por lenguaje natural --------
+    // -------- Crear evento (lenguaje natural) --------
     // Ej: "Dentista mañana 11am 1h en Altavista"
     //     "Comida, 5/9 14:00, 90m, @Roma"
     const when = parseWhen(text);
     if (!when) {
-      // No se detectó fecha/hora. Si el mensaje parece ser una instrucción de agenda, guía.
-      if (/\b(hoy|mañana|pasado|am|pm|\d{1,2}:\d{2}|\d{1,2}\/\d{1,2}|sept|oct|nov|dic)\b/i.test(text)) {
+      if (/\b(hoy|mañana|pasado|am|pm|\d{1,2}:\d{2}|\d{1,2}\/\d{1,2}|ene|feb|mar|abr|may|jun|jul|ago|sept?|oct|nov|dic)\b/i.test(text)) {
         await sendText(from, t('parse_fail_date'));
       } else {
         await sendText(from, t('generic_help'));
@@ -215,55 +256,19 @@ async function handleIncoming(msg) {
     const location = extractLocation(text);
     const title = inferTitle(text, { when, minutes, location });
 
-    // Crear en iCloud (CalDAV)
     try {
       await createEvent({ title, start: when, minutes, location });
       await sendText(from, t('event_created', { title, start: when, minutes, location }));
     } catch (err) {
+      console.error('[icloud] createEvent error:', err?.message);
       await sendText(from, 'No pude crear el evento. Intentemos otra vez en unos minutos.');
     }
   } catch (err) {
-    // Falla de router: que no se caiga
-    try { await sendText(msg.from, 'Ha ocurrido un detalle inesperado, pero sigo aquí.'); } catch(_) {}
+    console.error('[router] fatal error:', err?.message);
+    try { await sendText(msg?.from, 'Ha ocurrido un detalle inesperado, pero sigo aquí.'); } catch (_) {}
   }
 }
-function normalizeIncoming(payload) {
-  // Si ya parece el mensaje "plano", regresa tal cual
-  if (payload?.from || payload?.type || payload?.text) return payload;
 
-  // Forma cruda de WhatsApp Cloud API
-  try {
-    const entry = payload?.entry?.[0];
-    const value = entry?.changes?.[0]?.value;
-    const msg0  = value?.messages?.[0];
-    if (msg0) return msg0;           // ← este es el mensaje que queremos
-  } catch (_) {}
-
-  return payload || {};
-}
-async function handleIncoming(msg) {
-  try {
-    const m = normalizeIncoming(msg);  // <— usa el normalizador
-
-    console.log('[webhook] incoming:', {
-      from: m?.from || m?.sender || m?.phone_number,
-      type: m?.type,
-      hasText: !!(m?.text?.body || m?.body)
-    });
-
-    const from =
-      m.from || m.phone_number || m.sender;
-
-    const body =
-      (m.text && m.text.body) ||
-      (m.button && m.button.text) ||
-      (m.interactive && m.interactive?.button_reply?.title) ||
-      (m.body) ||
-      '';
-
-    const text = String(body || '').trim();
-    const low  = text.toLowerCase();
-    // ...  el resto igual, pero usando m en vez de msg cuando necesites el tipo:
-    // if (['image','document','audio','video'].includes(m.type)) { ... }
-module.exports = handleIncoming;                 // soporta: require('./intentRouter')
-module.exports.handleIncoming = handleIncoming;  // soporta: const { handleIncoming } = require('./intentRouter')
+// Export en ambas formas (named y default)
+module.exports = handleIncoming;
+module.exports.handleIncoming = handleIncoming;
