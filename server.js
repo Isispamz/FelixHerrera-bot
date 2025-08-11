@@ -1,7 +1,7 @@
-import 'dotenv/config';
-import express from 'express';
-import bodyParser from 'body-parser';
-import { handleIncoming } from './intentRouter.js;
+require('dotenv').config();
+const express = require('express');
+const bodyParser = require('body-parser');
+const { handleIncoming } = require('./intentRouter');
 
 const app = express();
 app.use(bodyParser.json());
@@ -11,7 +11,6 @@ app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-
   if (mode === 'subscribe' && token === process.env.WHATSAPP_VERIFY_TOKEN) {
     return res.status(200).send(challenge);
   }
