@@ -227,6 +227,43 @@ async function handleIncoming(msg) {
     try { await sendText(msg.from, 'Ha ocurrido un detalle inesperado, pero sigo aquí.'); } catch(_) {}
   }
 }
+function normalizeIncoming(payload) {
+  // Si ya parece el mensaje "plano", regresa tal cual
+  if (payload?.from || payload?.type || payload?.text) return payload;
 
+  // Forma cruda de WhatsApp Cloud API
+  try {
+    const entry = payload?.entry?.[0];
+    const value = entry?.changes?.[0]?.value;
+    const msg0  = value?.messages?.[0];
+    if (msg0) return msg0;           // ← este es el mensaje que queremos
+  } catch (_) {}
+
+  return payload || {};
+}
+async function handleIncoming(msg) {
+  try {
+    const m = normalizeIncoming(msg);  // <— usa el normalizador
+
+    console.log('[webhook] incoming:', {
+      from: m?.from || m?.sender || m?.phone_number,
+      type: m?.type,
+      hasText: !!(m?.text?.body || m?.body)
+    });
+
+    const from =
+      m.from || m.phone_number || m.sender;
+
+    const body =
+      (m.text && m.text.body) ||
+      (m.button && m.button.text) ||
+      (m.interactive && m.interactive?.button_reply?.title) ||
+      (m.body) ||
+      '';
+
+    const text = String(body || '').trim();
+    const low  = text.toLowerCase();
+    // ...  el resto igual, pero usando m en vez de msg cuando necesites el tipo:
+    // if (['image','document','audio','video'].includes(m.type)) { ... }
 module.exports = handleIncoming;                 // soporta: require('./intentRouter')
 module.exports.handleIncoming = handleIncoming;  // soporta: const { handleIncoming } = require('./intentRouter')
