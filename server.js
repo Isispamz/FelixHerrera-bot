@@ -1,36 +1,33 @@
-require('dotenv').config();
+// server.js — Webhook de WhatsApp + router
 const express = require('express');
-const bodyParser = require('body-parser');
+const app = express();
 const { handleIncoming } = require('./intentRouter');
 
-const app = express();
-app.use(bodyParser.json());
+const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || process.env.VERIFY_TOKEN || 'felix-verify';
+const PORT = process.env.PORT || 3000;
 
-// Verificación del webhook
+app.use(express.json());
+
+// Ping sencillo
+app.get('/', (_, res) => res.status(200).send('Felix Herrera bot up ✅'));
+
+// Verificación del webhook (GET) — Meta te manda hub.challenge
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === process.env.WHATSAPP_VERIFY_TOKEN) {
+
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
     return res.status(200).send(challenge);
   }
   return res.sendStatus(403);
 });
 
-// Mensajes entrantes
+// Recepción de eventos (POST)
 app.post('/webhook', async (req, res) => {
   try {
-    const changes = req.body.entry?.[0]?.changes?.[0]?.value;
-    const msg = changes?.messages?.[0];
-    if (msg) await handleIncoming(changes);
-  } catch (e) {
-    console.error('Webhook error', e);
-  }
-  res.sendStatus(200);
-});
+    const body = req.body;
 
-app.get('/', (_, res) => res.send('Félix Herrera bot up.'));
-
-app.listen(process.env.PORT || 3000, () => {
-  console.log(`Server on :${process.env.PORT || 3000}`);
-});
+    if (body?.object !== 'whatsapp_business_account') {
+      // No es de WhatsApp; ignora con 200 para que no reintenten
+      return res.sendStatus(20
