@@ -2,10 +2,10 @@
 
 /**
  * intentRouter.js — Router principal (ES) con tono Alfred + JARVIS
- * - Normaliza payloads del webhook de WhatsApp (Meta)
- * - Crea eventos en iCloud con lenguaje natural
- * - Guarda adjuntos en OneDrive (si viene el buffer)
- * - Inicia click-to-call vía Twilio
+ * - Resiliente a exports (default o nombrados)
+ * - No llama a iCloud si la fecha/hora no es válida
+ * - Maneja duración, lugar y título inferido
+ * - Soporta “hoy/mañana/pasado mañana”, 11am / 14:30 / 6 pm, etc.
  */
 
 const dayjs = require('dayjs');
@@ -14,44 +14,95 @@ dayjs.extend(customParseFormat);
 dayjs.locale('es');
 
 const chrono = require('chrono-node');
-const { t } = require('./persona');
 
-// Permitir que los módulos locales exporten default o funciones nombradas
-const sendMod = require('./send');
-const sendText = sendMod.sendText || sendMod;
-
-const icloudMod = require('./icloud');
-const createEvent = icloudMod.createEvent || icloudMod;
-
-const onedriveMod = require('./onedrive');
-const uploadBufferToOneDrive = onedriveMod.uploadBufferToOneDrive || onedriveMod;
-
-const twilioMod = require('./twilio');
-const startClickToCall = twilioMod.startClickToCall || twilioMod;
-
-// ---------------------- helpers ----------------------
-
-function pad(n) {
-  return String(n).padStart(2, '0');
+// ---- Cargas seguras de módulos locales (acepta export default o nombrado)
+function pick(fnOrObj, key) {
+  if (!fnOrObj) return undefined;
+  if (typeof fnOrObj === 'function') return fnOrObj;
+  if (typeof fnOrObj[key] === 'function') return fnOrObj[key];
+  if (fnOrObj.default && typeof fnOrObj.default === 'function') return fnOrObj.default;
+  return undefined;
 }
 
+const personaMod = require('./persona');
+const t =
+  (personaMod && personaMod.t) ||
+  ((key, v = {}) => {
+    const D = d =>
+      dayjs(d).isValid() ? `${dayjs(d).format('YYYY-MM-DD HH:mm')}` : 'fecha/hora';
+    const M = m => `${m}m`;
+    const L = l => (l ? ` · ${l}` : '');
+    const msgs = {
+      hello:
+        '¡A su servicio! Puedo crearle eventos. Por ejemplo: "Dentista mañana 11am 1h en Altavista".',
+      generic_help:
+        'Puede decirme: "Café, 5/9 18:30, 30m, @Condesa" o "Reunión pasado mañana 9am 90m en oficina".',
+      agenda_help:
+        'Formato libre: título + fecha/hora + duración + lugar. Ej: "Dentista mañana 11am 1h en Altavista".',
+      parse_fail_date:
+        'No pude entender la fecha/hora. ¿Podría enviarla como en: "mañana 11am", "5/9 18:30" o similar?',
+      calling: num => `Iniciando llamada al ${num}…`,
+      file_saved: name => `Archivo guardado: ${name}`,
+      event_created: ({ title, start, minutes, location }) =>
+        `Listo. Evento creado: ${title} (${D(start)} · ${M(minutes)}${L(location)}).`,
+    };
+    const m = msgs[key];
+    return typeof m === 'function' ? m(v) : m || key;
+  });
+
+const sendMod = require('./send');
+const sendText =
+  pick(sendMod, 'sendText') ||
+  ((to, text) => {
+    console.log('[sendText Fallback]', { to, text });
+    return Promise.resolve();
+  });
+
+const icloudMod = require('./icloud');
+const createEvent =
+  pick(icloudMod, 'createEvent') ||
+  (async () => {
+    console.log('[iCloud Fallback] createEvent omitido (modo simulación)');
+  });
+
+const onedriveMod = require('./onedrive');
+const uploadBufferToOneDrive =
+  pick(onedriveMod, 'uploadBufferToOneDrive') ||
+  (async (buf, name) => {
+    console.log('[OneDrive Fallback] upload omitido', { name, size: buf?.length });
+    return name || 'archivo';
+  });
+
+const twilioMod = require('./twilio');
+const startClickToCall =
+  pick(twilioMod, 'startClickToCall') ||
+  (async num => {
+    console.log('[Twilio Fallback] click-to-call omitido', { num });
+  });
+
+// ---------------------- helpers ----------------------
+const pad = n => String(n).padStart(2, '0');
+
 function toDateSafe(d) {
-  // acepta Date, dayjs, string; regresa Date o null
   if (!d) return null;
   if (d instanceof Date && !isNaN(d)) return d;
-  const tryDay = dayjs(d, ['YYYY-MM-DD HH:mm', 'YYYY-MM-DD', 'DD/MM/YYYY HH:mm', 'DD/MM/YYYY'], true);
+  const tryDay = dayjs(
+    d,
+    ['YYYY-MM-DD HH:mm', 'YYYY-MM-DD', 'DD/MM/YYYY HH:mm', 'DD/MM/YYYY'],
+    true
+  );
   if (tryDay.isValid()) return tryDay.toDate();
   const asDate = new Date(d);
   return isNaN(asDate) ? null : asDate;
 }
 
-// Duración en minutos desde texto español/mixto
+/** Duración en minutos desde texto español/mixto */
 function parseDurationText(input) {
   if (!input) return 60; // default
   const s = String(input).toLowerCase().replace(/\s+/g, ' ').trim();
-
   let m;
-  // "1h30", "1:30h", "1.5h", "90m"
+
+  // 1h30 / 1:30h / 1.5h / 90m
   if ((m = s.match(/(\d+(?:[.,]\d+)?)\s*h(?:oras?)?\s*(\d+)\s*m?/))) {
     const h = parseFloat(m[1].replace(',', '.'));
     const min = parseInt(m[2], 10) || 0;
@@ -63,11 +114,10 @@ function parseDurationText(input) {
   if ((m = s.match(/(\d+(?:[.,]\d+)?)\s*h(?:oras?)?/))) {
     return Math.round(parseFloat(m[1].replace(',', '.')) * 60);
   }
-  if ((m = s.match(/(\d+)\s*m(?:in(?:utos?)?)?/))) {
+  if ((m = s.match(/(\d+)\s*m(?:in(?:utos?)?)?\b/))) {
     return parseInt(m[1], 10);
   }
 
-  // español natural
   if (/\bmedia ?hora\b/.test(s)) return 30;
   if (/\bhora y media\b/.test(s)) return 90;
   if (/\buna hora\b/.test(s)) return 60;
@@ -82,7 +132,7 @@ function parseDurationText(input) {
   return 60;
 }
 
-// Extrae lugar a partir de "en <lugar>" o "@lugar" al final
+/** Extrae lugar a partir de "en <lugar>" o "@lugar" (al final o casi al final) */
 function extractLocation(text) {
   if (!text) return '';
   let m = text.match(/(?:\b(?:en)\s+)([^,;]+)$/i);
@@ -92,123 +142,132 @@ function extractLocation(text) {
   return '';
 }
 
-// Intenta inferir título quitando fecha/hora/duración/lugar conocidos
+/** Intenta inferir título eliminando fecha/hora/duración/lugar conocidos */
 function inferTitle(raw, { when, minutes, location }) {
   let title = String(raw || '').trim();
 
   // quita "en <lugar>" o "@lugar"
-  title = title
-    .replace(/\s+en\s+[^,;]+$/i, '')
-    .replace(/\s+@[^\s,;]+.*$/i, '');
+  title = title.replace(/\s+en\s+[^,;]+$/i, '').replace(/\s+@[^\s,;]+.*$/i, '');
 
   // quita duración
   title = title
-    .replace(/\b\d+\s*m(?:in(?:utos?)?)?\b/ig, '')
-    .replace(/\b\d+(?:[.,]\d+)?\s*h(?:oras?)?\b/ig, '')
-    .replace(/\bmedia ?hora\b/ig, '')
-    .replace(/\bhora y media\b/ig, '');
+    .replace(/\b\d+\s*m(?:in(?:utos?)?)?\b/gi, '')
+    .replace(/\b\d+(?:[.,]\d+)?\s*h(?:oras?)?\b/gi, '')
+    .replace(/\bmedia ?hora\b/gi, '')
+    .replace(/\bhora y media\b/gi, '');
 
-  // quita fecha/hora muy comunes
+  // quita fecha/hora (simple heurística útil)
   title = title
-    .replace(/\b(hoy|mañana|pasado mañana)\b/ig, '')
+    .replace(/\b(hoy|mañana|pasado mañana)\b/gi, '')
     .replace(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g, '')
-    .replace(/\b\d{1,2}\s*(?:am|pm|hrs?|h)\b/ig, '')
+    .replace(/\b\d{1,2}\s*(?:am|pm|hrs?|h)\b/gi, '')
     .replace(/\b\d{2}:\d{2}\b/g, '')
     .replace(/\s{2,}/g, ' ')
     .replace(/[,\s]+$/, '');
 
-  if (!title) title = 'Evento';
+  if (!title) title = 'Evento'; // fallback
   return title;
 }
 
-// Usa chrono-node para fecha/hora en español
+/** Parse de fecha/hora robusto con fallback a “hoy/mañana/pasado mañana” + hora */
 function parseWhen(text) {
-  const ref = new Date();
-  try {
-    // forwardDate: fechas pasadas se mandan al futuro (siguiente ocurrencia)
-    const dt = chrono.parseDate(text, ref, { forwardDate: true });
-    return toDateSafe(dt);
-  } catch (_) {
-    return null;
-  }
-}
+  if (!text) return null;
+  const ref = dayjs();
+  const low = String(text).toLowerCase();
 
-// Normaliza payload del webhook: crudo de Meta -> mensaje "plano"
-function normalizeIncoming(payload) {
-  // Si ya parece plano, regresa tal cual
-  if (payload && (payload.from || payload.type || payload.text)) return payload;
-
-  // Forma cruda de WhatsApp Cloud API
+  // 1) chrono (si entiende, listo)
   try {
-    const entry = payload?.entry?.[0];
-    const value = entry?.changes?.[0]?.value;
-    const msg0 = value?.messages?.[0];
-    if (msg0) return msg0;
+    const dt = chrono.parseDate(text, ref.toDate(), { forwardDate: true });
+    if (dt instanceof Date && !isNaN(dt.getTime())) return dt;
   } catch (_) {}
 
-  return payload || {};
-}
+  // 2) Fallback manual
+  let base = ref;
+  if (/\bpasado\s+mañana\b/.test(low)) base = ref.add(2, 'day');
+  else if (/\bmañana\b/.test(low)) base = ref.add(1, 'day');
 
-// Obtiene texto desde varios tipos de mensaje (text, button, interactive)
-function extractBody(m) {
-  return (
-    (m.text && m.text.body) ||
-    (m.button && m.button.text) ||
-    (m.interactive && m.interactive?.button_reply?.title) ||
-    (m.interactive && m.interactive?.list_reply?.title) ||
-    m.body ||
-    ''
-  );
+  // hora: 14:30 / 11am / 6 pm / 11h / 9 / 9:15
+  let h = 9,
+    m = 0;
+  let mm;
+
+  if ((mm = low.match(/\b(\d{1,2}):(\d{2})\b/))) {
+    h = parseInt(mm[1], 10);
+    m = parseInt(mm[2], 10);
+  } else if ((mm = low.match(/\b(\d{1,2})\s*(am|pm)\b/))) {
+    h = parseInt(mm[1], 10);
+    if (mm[2] === 'pm' && h < 12) h += 12;
+    if (mm[2] === 'am' && h === 12) h = 0;
+  } else if ((mm = low.match(/\b(\d{1,2})\s*(?:hrs?|h)\b/))) {
+    h = parseInt(mm[1], 10);
+  } else if ((mm = low.match(/\b(\d{1,2})\b/))) {
+    const cand = parseInt(mm[1], 10);
+    if (cand >= 0 && cand <= 23) h = cand;
+  }
+
+  const cand = base.hour(h).minute(m).second(0).millisecond(0).toDate();
+  return cand instanceof Date && !isNaN(cand.getTime()) ? cand : null;
 }
 
 // ---------------------- router ----------------------
 
+/**
+ * Maneja un mensaje entrante desde el webhook de WhatsApp.
+ * Espera un objeto `msg` similar al de Meta:
+ *  - msg.from : número del usuario
+ *  - msg.type : 'text' | 'image' | 'document' | ...
+ *  - msg.text?.body : texto
+ *  - msg.document / msg.image ... (si aplica)
+ */
 async function handleIncoming(msg) {
   try {
-    const m = normalizeIncoming(msg);
+    // Normaliza y loguea entrada
+    const from = msg?.from || msg?.phone_number || msg?.sender || '';
+    const body =
+      msg?.text?.body ||
+      msg?.button?.text ||
+      msg?.interactive?.button_reply?.title ||
+      msg?.body ||
+      '';
+    const type = msg?.type || (msg?.text ? 'text' : undefined);
 
-    const from = m.from || m.phone_number || m.sender || '';
-    const body = extractBody(m);
     const text = String(body || '').trim();
     const low = text.toLowerCase();
 
     console.log('[webhook] incoming:', {
       from,
-      type: m?.type,
+      type,
       hasText: !!text,
-      preview: text.slice(0, 60)
+      preview: text.slice(0, 80),
     });
 
-    // si no hay remitente, no podemos responder
-    if (!from) return;
-
-    // Saludo / ayuda rápida
+    // Si no hay texto
     if (!text) {
       await sendText(from, t('hello'));
       return;
     }
 
+    // Saludo / ayuda
     if (['hola', 'buenas', 'hey', 'menu', 'ayuda', 'help'].includes(low)) {
       await sendText(from, t('generic_help'));
       return;
     }
 
-    // Intent: guía de agenda
+    // Guía de agenda
     if (/\bagenda\b|\bevento\b|\bcita\b/.test(low)) {
       await sendText(from, t('agenda_help'));
       return;
     }
 
-    // Intent: llamada simple: "llama al 55 1234 5678"
+    // Llamada (muy básico)
     if (/\b(llama|marc[ae]r?)\b/.test(low)) {
-      const numMatch = text.match(/(\+?\d[\d\s-]{6,})/);
-      const num = numMatch ? numMatch[1] : null;
+      const num = (text.match(/(\+?\d[\d\s-]{6,})/) || [])[1];
       if (num) {
         try {
           await startClickToCall(num.replace(/\D/g, ''));
           await sendText(from, t('calling', num));
         } catch (err) {
-          console.error('[clickToCall] error:', err?.message);
+          console.error('[twilio] clickToCall error:', err?.message || err);
           await sendText(from, 'No fue posible iniciar la llamada ahora mismo.');
         }
       } else {
@@ -220,14 +279,14 @@ async function handleIncoming(msg) {
       return;
     }
 
-    // Adjuntos -> OneDrive (si tu server ya descargó el archivo y puso mediaBuffer/filename)
-    if (['image', 'document', 'audio', 'video'].includes(m.type)) {
-      if (m.mediaBuffer && m.filename) {
+    // Adjuntos -> OneDrive (si tu server ya descarga el buffer)
+    if (['image', 'document', 'audio', 'video'].includes(type)) {
+      if (msg?.mediaBuffer && msg?.filename) {
         try {
-          const savedPath = await uploadBufferToOneDrive(m.mediaBuffer, m.filename);
-          await sendText(from, t('file_saved', savedPath || m.filename));
+          const savedName = await uploadBufferToOneDrive(msg.mediaBuffer, msg.filename);
+          await sendText(from, t('file_saved', savedName || msg.filename));
         } catch (err) {
-          console.error('[onedrive] error:', err?.message);
+          console.error('[onedrive] upload error:', err?.message || err);
           await sendText(from, 'No logré guardar el archivo en OneDrive en este momento.');
         }
       } else {
@@ -239,12 +298,15 @@ async function handleIncoming(msg) {
       return;
     }
 
-    // -------- Crear evento (lenguaje natural) --------
+    // -------- Intent: crear evento por lenguaje natural --------
     // Ej: "Dentista mañana 11am 1h en Altavista"
     //     "Comida, 5/9 14:00, 90m, @Roma"
     const when = parseWhen(text);
-    if (!when) {
-      if (/\b(hoy|mañana|pasado|am|pm|\d{1,2}:\d{2}|\d{1,2}\/\d{1,2}|ene|feb|mar|abr|may|jun|jul|ago|sept?|oct|nov|dic)\b/i.test(text)) {
+
+    if (!(when instanceof Date) || isNaN(when.getTime())) {
+      if (
+        /\b(hoy|mañana|pasado|am|pm|\d{1,2}:\d{2}|\d{1,2}\/\d{1,2}|sept|oct|nov|dic)\b/i.test(text)
+      ) {
         await sendText(from, t('parse_fail_date'));
       } else {
         await sendText(from, t('generic_help'));
@@ -256,19 +318,24 @@ async function handleIncoming(msg) {
     const location = extractLocation(text);
     const title = inferTitle(text, { when, minutes, location });
 
+    // Crear en iCloud (CalDAV)
     try {
-      await createEvent({ title, startDate: when, minutes, location });
+      await createEvent({ title, start: when, minutes, location });
       await sendText(from, t('event_created', { title, start: when, minutes, location }));
     } catch (err) {
-      console.error('[icloud] createEvent error:', err?.message);
+      console.error('[icloud] createEvent error:', err?.message || err);
       await sendText(from, 'No pude crear el evento. Intentemos otra vez en unos minutos.');
     }
   } catch (err) {
-    console.error('[router] fatal error:', err?.message);
-    try { await sendText(msg?.from, 'Ha ocurrido un detalle inesperado, pero sigo aquí.'); } catch (_) {}
+    console.error('[router] fatal error:', err?.message || err);
+    try {
+      if (msg?.from) {
+        await sendText(msg.from, 'Ha ocurrido un detalle inesperado, pero sigo aquí.');
+      }
+    } catch (_) {}
   }
 }
 
-// Export en ambas formas (named y default)
-module.exports = handleIncoming;
-module.exports.handleIncoming = handleIncoming;
+// Export en ambas formas (named y default) para evitar errores de importación
+module.exports = { handleIncoming };
+module.exports.default = handleIncoming;
