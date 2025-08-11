@@ -5,7 +5,7 @@
   "scripts": {
     "start": "node server.js"
   },
-  "dependencies": {
+  "dependencies": {"chrono-node": "^2.7.6"
     "axios": "^1.7.2",
     "dayjs": "^1.11.11",
     "dotenv": "^16.4.5",
