@@ -257,7 +257,7 @@ async function handleIncoming(msg) {
     const title = inferTitle(text, { when, minutes, location });
 
     try {
-      await createEvent({ title, start: when, minutes, location });
+      await createEvent({ title, startDate: when, minutes, location });
       await sendText(from, t('event_created', { title, start: when, minutes, location }));
     } catch (err) {
       console.error('[icloud] createEvent error:', err?.message);
