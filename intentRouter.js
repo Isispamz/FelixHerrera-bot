@@ -1,35 +1,90 @@
 const dayjs = require('dayjs');
+const customParseFormat = require('dayjs/plugin/customParseFormat');
+dayjs.extend(customParseFormat);
+dayjs.locale('es');
+
 const { sendText } = require('./send');
 const { createEvent } = require('./icloud');
 const { uploadBufferToOneDrive } = require('./onedrive');
 const { startClickToCall } = require('./twilio');
 
-// Node 20 trae fetch nativo: usamos globalThis.fetch
+// ---- helpers ----
+function parseDate(input) {
+  if (!input) return null;
+  const s = String(input).trim()
+    .replace(/\s+/g, ' ')
+    .replace('sept', 'sep'); // normaliza abreviación común en ES-MX
 
+  const nowY = new Date().getFullYear();
+  const candidates = [
+    'YYYY-MM-DD HH:mm',
+    'YYYY-MM-DDTHH:mm',
+    'DD-MM-YYYY HH:mm',
+    'D/M/YYYY H:mm',
+    'D/M H:mm',
+    'D MMM YYYY HH:mm',
+    'D MMMM YYYY HH:mm',
+    'D MMM HH:mm',
+    'D MMMM HH:mm'
+  ];
+
+  // intenta tal cual
+  for (const f of candidates) {
+    const d = dayjs(s, f, true);
+    if (d.isValid()) return d.toDate();
+  }
+  // intenta agregando el año actual si falta
+  for (const f of candidates) {
+    const d = dayjs(`${s} ${nowY}`, f.replace(' YYYY', '') + ' YYYY', true);
+    if (d.isValid()) return d.toDate();
+  }
+  // fallback: si viene como "YYYY-MM-DD 11:00", convierte al ISO con T
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(s)) {
+    const d = new Date(s.replace(' ', 'T'));
+    if (!isNaN(d)) return d;
+  }
+  return null;
+}
+
+function parseDuration(input) {
+  const str = String(input || '60m').trim().toLowerCase().replace(/\s/g, '');
+  if (/^\d+h$/.test(str)) return parseInt(str) * 60;
+  if (/^\d+m$/.test(str)) return parseInt(str);
+  const n = parseInt(str); // si no trae sufijo, asume minutos
+  return isNaN(n) ? 60 : n;
+}
+
+// ---- main ----
 async function handleIncoming(change) {
   const msg = change.messages?.[0];
   const from = msg?.from;
 
   if (msg?.type === 'text') {
-    const t = (msg.text?.body || '').trim().toLowerCase();
+    const raw = (msg.text?.body || '').trim();
+    const t = raw.toLowerCase();
 
-    if (/(agenda|evento|cita)/.test(t)) {
-      await sendText(from, 'Dime: título, fecha y hora. Ej: "Dentista, 5 sept 11:00, 1h, Altavista"');
+    if (/(^|\b)(agenda|evento|cita)(\b|$)/.test(t)) {
+      await sendText(from, 'Dime: título, fecha y hora. Ej: "Dentista, 2025-09-05 11:00, 60m, Altavista"');
       return;
     }
 
-    // Ejemplo simple: "Dentista, 5 sept 11:00, 1h, Altavista"
-    if (/\d/.test(t) && t.includes(',')) {
+    // patrón "Título, fecha hora, duración, lugar"
+    if (raw.includes(',')) {
       try {
-        const [title, dateTime, duration, location] = t.split(',').map(x => x.trim());
-        const start = dayjs(dateTime).toDate();
-        const minutes = parseInt((duration || '60').replace(/\D/g,'')) || 60;
+        const [title, dateTimeStr, durationStr, location] = raw.split(',').map(x => x.trim());
+        const start = parseDate(dateTimeStr);
+        if (!start) {
+          await sendText(from, 'No entendí la fecha/hora. Ejemplo: "Dentista, 2025-09-05 11:00, 60m, Altavista"');
+          return;
+        }
+        const minutes = parseDuration(durationStr);
         const end = new Date(start.getTime() + minutes * 60000);
+
         await createEvent({ title, start, end, location });
-        await sendText(from, `Listo. Evento creado: ${title} (${dateTime}, ${duration||'60m'}).`);
+        await sendText(from, `Listo. Evento creado: ${title} (${dayjs(start).format('YYYY-MM-DD HH:mm')} · ${minutes}m${location ? ` · ${location}` : ''}).`);
       } catch (e) {
         console.error(e);
-        await sendText(from, 'No pude entender la fecha/hora. Mándalo como en el ejemplo, porfa.');
+        await sendText(from, 'No pude crear el evento. Intenta otra vez con el formato del ejemplo.');
       }
       return;
     }
