@@ -1,16 +1,17 @@
-import fetch from 'node-fetch';
-import dayjs from 'dayjs';
-import { sendText } from './send.js';
-import { createEvent } from './icloud.js';
-import { uploadBufferToOneDrive } from './onedrive.js';
-import { startClickToCall } from './twilio.js';
+const dayjs = require('dayjs');
+const { sendText } = require('./send');
+const { createEvent } = require('./icloud');
+const { uploadBufferToOneDrive } = require('./onedrive');
+const { startClickToCall } = require('./twilio');
 
-export async function handleIncoming(change) {
+// Node 20 trae fetch nativo: usamos globalThis.fetch
+
+async function handleIncoming(change) {
   const msg = change.messages?.[0];
   const from = msg?.from;
 
   if (msg?.type === 'text') {
-    const t = msg.text.body.trim().toLowerCase();
+    const t = (msg.text?.body || '').trim().toLowerCase();
 
     if (/(agenda|evento|cita)/.test(t)) {
       await sendText(from, 'Dime: título, fecha y hora. Ej: "Dentista, 5 sept 11:00, 1h, Altavista"');
@@ -61,3 +62,5 @@ export async function handleIncoming(change) {
     return;
   }
 }
+
+module.exports = { handleIncoming };
