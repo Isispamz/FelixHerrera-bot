@@ -1,17 +1,18 @@
 {
   "name": "felix-bot",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "engines": { "node": "20.x" },
   "scripts": {
     "start": "node server.js"
   },
-  "dependencies": {"chrono-node": "^2.7.6"
+  "dependencies": {
     "axios": "^1.7.2",
+    "chrono-node": "^2.7.6",
     "dayjs": "^1.11.11",
+    "dav": "^1.8.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "twilio": "^4.22.0",
-    "uuid": "^9.0.1",
-    "dav": "^1.8.0"
+    "uuid": "^9.0.1"
   }
 }
