@@ -109,7 +109,47 @@ function previewOf(msg) {
   const text = (msg?.text?.body || '').trim();
   return text.slice(0, 80);
 }
+// ---------- comandos útiles ----------
+if (low.startsWith('/')) {
+  const [cmd, ...rest] = low.split(/\s+/);
+  const argText = text.slice(cmd.length).trim();
 
+  switch (cmd) {
+    case '/comandos':
+      await sendText(from, t('commands'));
+      return;
+
+    case '/agenda':
+      await sendText(from, t('agenda_help'));
+      return;
+
+    case '/plantilla':
+      await sendText(from, t('plantilla'));
+      return;
+
+    case '/ping':
+      await sendText(from, t('pong'));
+      return;
+
+    case '/cc': // click-to-call
+      if (!argText) {
+        await sendText(from, 'Indíqueme el número, señorita. Ej: /cc 55 1234 5678');
+        return;
+      }
+      try {
+        const num = argText.replace(/\D/g, '');
+        await startClickToCall(num);
+        await sendText(from, t('calling', { title: num }));
+      } catch {
+        await sendText(from, 'No fue posible iniciar la llamada ahora mismo, señorita.');
+      }
+      return;
+
+    default:
+      await sendText(from, t('commands'));
+      return;
+  }
+}
 // -------------- comandos de agenda --------------
 
 async function cmdList(from, low) {
