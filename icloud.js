@@ -1,23 +1,18 @@
 // icloud.js — Crear eventos en iCloud vía CalDAV
-// Soporta dos caminos:
-// 1) DIRECTO con ICLOUD_CAL_URL -> PUT del ICS directo
-// 2) Descubrimiento con 'dav' si no se proporciona la URL
+// Camino 1: DIRECTO con ICLOUD_CAL_URL -> PUT del ICS
+// Camino 2: Descubrimiento + dav.createCalendarObject
 
 const crypto = require('crypto');
 
-// Entorno
 const USER = process.env.ICLOUD_USERNAME || '';
 const PASS = process.env.ICLOUD_APP_PASSWORD || '';
 const DIRECT_URL = process.env.ICLOUD_CAL_URL || process.env.ICLOUD_CALENDAR_URL || '';
 const CALDAV_BASE = process.env.ICLOUD_CALDAV_BASE || 'https://caldav.icloud.com';
 
-// Node 20+ tiene fetch global
 const hasFetch = typeof fetch === 'function';
-
-// Carga perezosa de 'dav' sólo si hace falta
 let dav = null;
 
-// ---------- utilidades ----------
+// -------- helpers --------
 function ensureCreds() {
   if (!USER || !PASS) {
     const msg = 'ICLOUD_USERNAME / ICLOUD_APP_PASSWORD no configurados.';
@@ -27,7 +22,7 @@ function ensureCreds() {
 }
 
 function toICSDate(d) {
-  const iso = new Date(d).toISOString(); // 2025-08-11T17:00:00.000Z
+  const iso = new Date(d).toISOString();
   return iso.replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z'); // 20250811T170000Z
 }
 
@@ -36,7 +31,6 @@ function buildICS({ uid, title, start, end, location }) {
   const dtStart = toICSDate(start);
   const dtEnd = toICSDate(end);
 
-  // Líneas plegadas según RFC 5545 (simple, sin pliegues por longitud)
   return [
     'BEGIN:VCALENDAR',
     'VERSION:2.0',
@@ -69,17 +63,17 @@ function buildAuthHeader(user, pass) {
   return 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
 }
 
-function ensureTrailingSlash(u) {
+function ensureSlash(u) {
   return /\/$/.test(u) ? u : (u + '/');
 }
 
-// ---------- PUT directo ----------
+// -------- PUT directo (sin dav) --------
 async function putICSDirect(collectionUrl, ics, uid) {
   if (!hasFetch) throw new Error('fetch no está disponible en este entorno.');
   if (!collectionUrl || typeof collectionUrl !== 'string') {
-    throw new Error("ICLOUD_CAL_URL inválida: se esperaba una string con la colección CalDAV");
+    throw new Error('ICLOUD_CAL_URL inválida (se esperaba string con / final).');
   }
-  const base = ensureTrailingSlash(collectionUrl);
+  const base = ensureSlash(collectionUrl);
   const resourceUrl = base + encodeURIComponent(`${uid}.ics`);
 
   const res = await fetch(resourceUrl, {
@@ -87,23 +81,23 @@ async function putICSDirect(collectionUrl, ics, uid) {
     headers: {
       'Authorization': buildAuthHeader(USER, PASS),
       'Content-Type': 'text/calendar; charset=utf-8',
-      'If-None-Match': '*', // crea sólo si no existe
+      'If-None-Match': '*',
     },
     body: ics,
   });
 
-  if (res.status >= 200 && res.status < 300) return true;
+  if (res.ok) return true;
 
   const text = await res.text().catch(() => '');
   throw new Error(`CalDAV PUT falló (${res.status}): ${text.slice(0, 200)}`);
 }
 
-// ---------- Descubrimiento con 'dav' ----------
-async function discoverCalendarUrl() {
+// -------- Descubrimiento + createCalendarObject --------
+async function discoverWithDav() {
   if (!dav) {
     try { dav = require('dav'); }
     catch (e) {
-      console.error('[icloud] No se pudo cargar "dav". Instálelo con "npm i dav" o use ICLOUD_CAL_URL.');
+      console.error('[icloud] No se pudo cargar "dav". Instale con "npm i dav" o use ICLOUD_CAL_URL.');
       throw e;
     }
   }
@@ -119,39 +113,32 @@ async function discoverCalendarUrl() {
     loadObjects: false,
   });
 
-  const cals = account?.calendars || [];
-  console.log('[icloud] descubiertos', cals.map(c => ({
-    name: c.displayName, url: c.url,
-  })));
+  const calendars = account?.calendars || [];
+  console.log('[icloud] descubiertos', calendars.map(c => ({ name: c.displayName, url: c.url })));
 
-  // Heurística: el primero o uno con “Home/Calendario/Calendar”
   const preferred =
-    cals.find(c => /home|calendar|calendario/i.test(c.displayName || '')) ||
-    cals[0];
+    calendars.find(c => /home|calendar|calendario/i.test(c.displayName || '')) ||
+    calendars[0];
 
-  return preferred?.url || null;
-}
-
-async function putICSViaDav(calendarUrl, ics, uid) {
-  const xhr = new dav.transport.Basic(
-    new dav.Credentials({ username: USER, password: PASS })
-  );
-
-  // createObject necesita la URL de la colección
-  if (!calendarUrl || typeof calendarUrl !== 'string') {
-    throw new Error("No se obtuvo URL de calendario (descubrimiento vacío). Defina ICLOUD_CAL_URL.");
+  if (!preferred) {
+    throw new Error('No se encontró ninguna colección CalDAV. Configure ICLOUD_CAL_URL.');
   }
 
-  await dav.createObject(xhr, calendarUrl, {
-    data: ics,
-    filename: `${uid}.ics`,
-    contentType: 'text/calendar; charset=utf-8',
-  });
+  return { calendar: preferred, xhr };
+}
 
+async function createViaDav(calendar, xhr, ics /*, uid */) {
+  // En varios builds de "dav" no existe createObject; el correcto es createCalendarObject
+  // filename es opcional; many servers lo ignoran.
+  await dav.createCalendarObject(calendar, {
+    data: ics,
+    xhr,
+    // filename: `${uid}.ics`,
+  });
   return true;
 }
 
-// ---------- API principal ----------
+// -------- API principal --------
 async function createEvent({ title, start, startDate, minutes, location }) {
   ensureCreds();
 
@@ -167,20 +154,14 @@ async function createEvent({ title, start, startDate, minutes, location }) {
     '}'
   );
 
-  // 1) Intento directo si tenemos ICLOUD_CAL_URL
+  // Camino 1: directo si tenemos ICLOUD_CAL_URL
   if (DIRECT_URL) {
     return putICSDirect(DIRECT_URL, ics, uid);
   }
 
-  // 2) Descubrimiento con dav
-  const calUrl = await discoverCalendarUrl();
-  if (!calUrl) {
-    const msg = 'No se encontró ninguna colección CalDAV. Por favor configure ICLOUD_CAL_URL (termina en "/").';
-    console.error('[icloud]', msg);
-    throw new Error(msg);
-  }
-
-  return putICSViaDav(calUrl, ics, uid);
+  // Camino 2: descubrimiento + createCalendarObject
+  const { calendar, xhr } = await discoverWithDav();
+  return createViaDav(calendar, xhr, ics /*, uid */);
 }
 
 module.exports = { createEvent };
