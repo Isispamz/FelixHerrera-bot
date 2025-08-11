@@ -1,183 +1,162 @@
-// icloud.js — iCloud CalDAV via `dav`
-// Crea eventos en el calendario de iCloud con entrada tolerante y validaciones.
+// icloud.js — iCloud CalDAV helpers (crear, listar, buscar, actualizar, borrar)
 
 const dav = require('dav');
-const crypto = require('crypto');
+const url = require('url');
 
-// ---------- Config ----------
-const SERVER = process.env.ICLOUD_CALDAV_URL || 'https://caldav.icloud.com';
-const USERNAME = process.env.ICLOUD_USERNAME || '';
-const PASSWORD = process.env.ICLOUD_APP_PASSWORD || '';
-const CALENDAR_NAME = process.env.ICLOUD_CALENDAR_NAME || ''; // opcional
+const USER = process.env.ICLOUD_USERNAME;
+const PASS = process.env.ICLOUD_APP_PASSWORD;
+const CAL_URL = process.env.ICLOUD_CALENDAR_URL || ''; // opcional
 
-// ---------- Utils ----------
-function pad(n) { return String(n).padStart(2, '0'); }
-
-function formatUTC(dt) {
-  // YYYYMMDDTHHMMSSZ
-  const y = dt.getUTCFullYear();
-  const m = pad(dt.getUTCMonth() + 1);
-  const d = pad(dt.getUTCDate());
-  const hh = pad(dt.getUTCHours());
-  const mm = pad(dt.getUTCMinutes());
-  const ss = pad(dt.getUTCSeconds());
-  return `${y}${m}${d}T${hh}${mm}${ss}Z`;
+if (!USER || !PASS) {
+  throw new Error('ICLOUD_USERNAME / ICLOUD_APP_PASSWORD no configurados.');
 }
 
-function ensureDate(x) {
-  if (!x) return null;
-  if (x instanceof Date && !isNaN(x)) return x;
-  const try1 = new Date(x);
-  if (!isNaN(try1)) return try1;
-  return null;
-}
-
-function escapeICal(text = '') {
-  return String(text)
-    .replace(/\\/g, '\\\\')
-    .replace(/;/g, '\\;')
-    .replace(/,/g, '\\,')
-    .replace(/\r?\n/g, '\\n');
-}
-
-// Crea un UID estable/único
-function makeUID() {
-  if (crypto.randomUUID) return crypto.randomUUID();
-  return crypto.randomBytes(16).toString('hex');
-}
-
-// ---------- DAV session cache ----------
-let _cache = {
-  xhr: null,
-  account: null,
-  calendar: null,
-  lastAt: 0
-};
-
-function makeTransport() {
-  // `dav.transport.Basic` con credenciales
-  const creds = new dav.Credentials({
-    username: USERNAME,
-    password: PASSWORD
-  });
-  return new dav.transport.Basic(creds);
-}
-
-async function resolveAccountAndCalendar() {
-  const FRESH_MS = 15 * 60 * 1000; // 15 minutos
-  const now = Date.now();
-
-  if (_cache.account && _cache.calendar && (now - _cache.lastAt) < FRESH_MS) {
-    return { xhr: _cache.xhr, account: _cache.account, calendar: _cache.calendar };
-  }
-
-  if (!USERNAME || !PASSWORD) {
-    throw new Error('ICLOUD_USERNAME / ICLOUD_APP_PASSWORD no configurados.');
-  }
-
-  const xhr = makeTransport();
-
-  // Descubrimiento de cuenta + colecciones
+async function getAccount() {
+  const xhr = new dav.transport.Basic(
+    new dav.Credentials({ username: USER, password: PASS })
+  );
   const account = await dav.createAccount({
-    server: SERVER,
+    server: 'https://caldav.icloud.com',
     xhr,
     loadCollections: true,
-    loadObjects: false
+    loadObjects: false,
   });
-
-  if (!account || !Array.isArray(account.calendars) || account.calendars.length === 0) {
-    throw new Error('No se encontraron calendarios en la cuenta iCloud.');
-  }
-
-  // Selección de calendario
-  let calendar = account.calendars[0];
-  if (CALENDAR_NAME) {
-    const byName = account.calendars.find(c => (c.displayName || '').toLowerCase() === CALENDAR_NAME.toLowerCase());
-    if (byName) calendar = byName;
-  }
-
-  _cache = { xhr, account, calendar, lastAt: now };
-  return { xhr, account, calendar };
+  return { xhr, account };
 }
 
-// ---------- Normalización de entrada ----------
-function normalizeEventInput(evt) {
-  const title = (evt && evt.title) ? String(evt.title).trim() : 'Evento';
-  const minutes = Math.max(1, parseInt(evt?.minutes, 10) || 60);
-  const location = (evt && evt.location) ? String(evt.location).trim() : '';
-  const description = (evt && evt.description) ? String(evt.description).trim() : '';
-
-  // aceptar startDate | start | when | date
-  const startCandidate = evt?.startDate || evt?.start || evt?.when || evt?.date;
-  const startDate = ensureDate(startCandidate);
-  if (!startDate) {
-    throw new Error('startDate/start/when/date inválido o ausente.');
+function pickCalendar(collections) {
+  if (CAL_URL) {
+    const match = collections.find(c => (c && c.url && c.url.includes(CAL_URL)));
+    if (match) return match;
   }
-
-  // endDate opcional; si no, lo calculamos con minutes
-  let endDate = ensureDate(evt?.endDate);
-  if (!endDate) {
-    endDate = new Date(startDate.getTime() + minutes * 60000);
-  }
-
-  return { title, minutes, location, description, startDate, endDate };
+  // fallback: primer calendario "writable"
+  return collections.find(c => c.components?.includes('VEVENT')) || collections[0];
 }
 
-// ---------- ICS builder ----------
-function buildICS({ title, startDate, endDate, location, description }) {
-  const uid = makeUID();
-  const dtstamp = formatUTC(new Date());
-  const dtstart = formatUTC(startDate);
-  const dtend = formatUTC(endDate);
+function toISOZ(d) {
+  return new Date(d).toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
 
-  const lines = [
+function buildICS({ uid, title, start, minutes = 60, location = '' }) {
+  const startISO = toISOZ(start);
+  const endISO = toISOZ(new Date(new Date(start).getTime() + minutes * 60000));
+  const dtstamp = toISOZ(new Date());
+  const _uid = uid || `${Date.now()}-${Math.random().toString(36).slice(2)}@felixbot`;
+
+  return [
     'BEGIN:VCALENDAR',
-    'PRODID:-//FelixHerrera-bot//iCloud//ES',
     'VERSION:2.0',
-    'CALSCALE:GREGORIAN',
-    'METHOD:PUBLISH',
+    'PRODID:-//felixbot//iCloud CalDAV//EN',
     'BEGIN:VEVENT',
-    `UID:${uid}`,
-    `DTSTAMP:${dtstamp}`,
-    `DTSTART:${dtstart}`,
-    `DTEND:${dtend}`,
-    `SUMMARY:${escapeICal(title)}`,
-  ];
-
-  if (location) lines.push(`LOCATION:${escapeICal(location)}`);
-  if (description) lines.push(`DESCRIPTION:${escapeICal(description)}`);
-
-  lines.push('END:VEVENT', 'END:VCALENDAR');
-
-  return { uid, ics: lines.join('\r\n') };
+    `UID:${_uid}`,
+    `DTSTAMP:${dtstamp.replace(/[-:]/g,'').replace(/\.\d{3}Z$/,'Z')}`,
+    `DTSTART:${startISO.replace(/[-:]/g,'').replace(/\.\d{3}Z$/,'Z')}`,
+    `DTEND:${endISO.replace(/[-:]/g,'').replace(/\.\d{3}Z$/,'Z')}`,
+    `SUMMARY:${title}`,
+    location ? `LOCATION:${location}` : '',
+    'END:VEVENT',
+    'END:VCALENDAR',
+    ''
+  ].filter(Boolean).join('\r\n');
 }
 
-// ---------- API principal ----------
-/**
- * createEvent({ title, startDate|start|when|date, minutes?, endDate?, location?, description? })
- * @returns {Promise<{uid:string, href:string}>}
- */
-async function createEvent(evt) {
-  // Normaliza entrada (lanza si no hay fecha válida)
-  const norm = normalizeEventInput(evt);
+function parseICS(ics) {
+  // parsing muy ligero; suficiente para listar/mover/cancelar
+  const get = (re) => (ics.match(re) || [,''])[1].trim();
+  const uid = get(/\nUID:([^\r\n]+)/i);
+  const summary = get(/\nSUMMARY:([^\r\n]+)/i) || 'Evento';
+  const location = get(/\nLOCATION:([^\r\n]+)/i) || '';
+  const dtstart = get(/\nDTSTART(?:;[^:]+)?:([^\r\n]+)/i);
+  const dtend = get(/\nDTEND(?:;[^:]+)?:([^\r\n]+)/i);
 
-  // Carga cuenta y calendario
-  const { xhr, calendar } = await resolveAccountAndCalendar();
+  const toDate = (s) => {
+    // soporta YYYYMMDDTHHmmssZ
+    const m = s.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+    if (!m) return null;
+    return new Date(Date.UTC(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +m[6]));
+    // (si tuvieras DTSTART;VALUE=DATE usa medianoche)
+  };
 
-  // Construye ICS
-  const { uid, ics } = buildICS(norm);
-  const filename = `${uid}.ics`;
+  const start = toDate(dtstart);
+  const end = toDate(dtend);
+  const minutes = (start && end) ? Math.max(1, Math.round((end - start)/60000)) : 60;
+  return { uid, title: summary, start, end, minutes, location };
+}
 
-  // Crea el objeto en el calendario
-  const res = await dav.createCalendarObject(calendar, {
-    data: ics,
-    filename,
-    xhr // pasar el transport explícitamente
+// ---------- API pública ----------
+
+async function createEvent({ title, start, minutes = 60, location = '' }) {
+  const { xhr, account } = await getAccount();
+  const cal = pickCalendar(account.calendars || account.collections || []);
+  if (!cal) throw new Error('No encontré un calendario en iCloud.');
+
+  const ics = buildICS({ title, start, minutes, location });
+  await dav.createCalendarObject(cal, { data: ics, xhr });
+  return true;
+}
+
+async function listEvents({ from, to }) {
+  const { xhr, account } = await getAccount();
+  const cal = pickCalendar(account.calendars || account.collections || []);
+  if (!cal) throw new Error('No encontré un calendario en iCloud.');
+
+  // pidiendo objetos en rango
+  const objects = await dav.listCalendarObjects(cal, {
+    xhr,
+    timeRange: { start: from, end: to },
+    expand: true
   });
 
-  // `res` puede ser undefined según versión; devolvemos datos útiles
-  const href = (res && (res.href || res.url)) || `${calendar.url.replace(/\/+$/, '')}/${filename}`;
-  return { uid, href };
+  const events = [];
+  for (const obj of objects || []) {
+    try {
+      const ics = obj?.data || '';
+      const parsed = parseICS(ics);
+      if (parsed?.start) {
+        parsed.href = obj?.url; // para update/delete
+        events.push(parsed);
+      }
+    } catch (_) {}
+  }
+  // orden cronológico
+  events.sort((a,b) => (a.start - b.start));
+  return events;
 }
 
-module.exports = { createEvent };
+async function findEventByTitle(query, { from, to }) {
+  const q = String(query || '').toLowerCase().trim();
+  if (!q) return null;
+  const list = await listEvents({ from, to });
+  // heurística: incluye título y el más próximo en el tiempo
+  const candidates = list.filter(ev => ev.title.toLowerCase().includes(q));
+  return candidates[0] || null;
+}
+
+async function deleteEvent(event) {
+  if (!event?.href) throw new Error('Evento sin href para borrar.');
+  const { xhr } = await getAccount();
+  await dav.deleteCalendarObject(event.href, { xhr });
+  return true;
+}
+
+async function updateEvent(event, { start, minutes, location }) {
+  if (!event?.href) throw new Error('Evento sin href para actualizar.');
+  const { xhr } = await getAccount();
+  const ics = buildICS({
+    uid: event.uid,
+    title: event.title,
+    start,
+    minutes: minutes || event.minutes || 60,
+    location: (location != null ? location : event.location) || ''
+  });
+  await dav.updateCalendarObject(event.href, { data: ics, xhr });
+  return true;
+}
+
+module.exports = {
+  createEvent,
+  listEvents,
+  findEventByTitle,
+  updateEvent,
+  deleteEvent
+};
