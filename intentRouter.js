@@ -1,4 +1,5 @@
 const dayjs = require('dayjs');
+const { t } = require('./persona');
 const customParseFormat = require('dayjs/plugin/customParseFormat');
 dayjs.extend(customParseFormat);
 dayjs.locale('es');
@@ -91,7 +92,7 @@ async function handleIncoming(change) {
 
     // palabras clave para abrir el modo agenda
     if (/(\bagenda\b|\bevento\b|\bcita\b)/i.test(raw)) {
-      await sendText(from, 'Ok. Dime algo como: "Dentista mañana 11am 1h en Altavista" o "Cena, 5 sept 20:30, 90m, @Roma". Si omites duración uso 60m.');
+     await sendText(from, t('agenda_help'));
       return;
     }
 
@@ -101,12 +102,16 @@ async function handleIncoming(change) {
       try {
         const end = new Date(ev.start.getTime() + ev.minutes * 60000);
         await createEvent({ title: ev.title, start: ev.start, end, location: ev.location });
-        await sendText(from,
-          `Listo. Evento creado: ${ev.title} (${dayjs(ev.start).format('YYYY-MM-DD HH:mm')} · ${ev.minutes}m${ev.location ? ' · ' + ev.location : ''}).`
+        await sendText(from, t('event_created', {
+  title,            // string
+  start,            // Date (si tu variable se llama startDate, usa start: startDate)
+  minutes,          // número en minutos
+  location          // string o '' si no hay
+}));
         );
       } catch (e) {
         console.error(e);
-        await sendText(from, 'No pude crear el evento. Intenta otra vez o dame otro formato (ej: "Reunión mañana 10am 45m en oficina").');
+        await sendText(from, t('parse_fail_date'));
       }
       return;
     }
