@@ -1,9 +1,9 @@
 import fetch from 'node-fetch';
 import dayjs from 'dayjs';
-import { sendText } from './services/whatsapp/send.js';
-import { createEvent } from './services/calendar/icloud.js';
-import { uploadBufferToOneDrive } from './services/storage/onedrive.js';
-import { startClickToCall } from './services/calls/twilio.js';
+import { sendText } from './send.js';
+import { createEvent } from './icloud.js';
+import { uploadBufferToOneDrive } from './onedrive.js';
+import { startClickToCall } from './twilio.js';
 
 export async function handleIncoming(change) {
   const msg = change.messages?.[0];
