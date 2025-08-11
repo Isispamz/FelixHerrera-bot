@@ -1,140 +1,220 @@
+// intentRouter.js — Router principal (ES) con tono Alfred + JARVIS
+// ---------------------------------------------------------------
+
 const dayjs = require('dayjs');
-const { t } = require('./persona');
 const customParseFormat = require('dayjs/plugin/customParseFormat');
 dayjs.extend(customParseFormat);
 dayjs.locale('es');
 
-const chrono = require('chrono-node'); // parser de lenguaje natural (ES)
-const { sendText } = require('./send');
-const { createEvent } = require('./icloud');
-const { uploadBufferToOneDrive } = require('./onedrive');
-const { startClickToCall } = require('./twilio');
+const chrono = require('chrono-node');
 
-// ---------- helpers ----------
-function parseDurationText(s) {
-  if (!s) return 60;
-  const str = String(s).toLowerCase().replace(/\s+/g, '');
-  // horas + minutos: "1h30m", "1h", "90m", "1.5h", "hora y media", "mediahora"
-  if (/^\d+(?:[.,]\d+)?h(\d+m)?$/.test(str)) {
-    const h = parseFloat(str.replace(/h.*/,'').replace(',','.'));
-    const m = (str.match(/(\d+)m/) || [0,0])[1];
-    return Math.round(h*60) + parseInt(m || 0);
-  }
-  if (/^\d+m$/.test(str)) return parseInt(str);
-  if (/^(\d+(?:[.,]\d+)?)h$/.test(str)) return Math.round(parseFloat(RegExp.$1.replace(',','.'))*60);
-  if (/mediashora/.test(str) || /mediahora/.test(str) || /mediah/.test(str)) return 30;
-  if (/horaymedia/.test(str) || /horaymedia/.test(str)) return 90;
+const { t } = require('./persona');
+const { sendText } = require('./send');                 // sendText(to, body)
+const { createEvent } = require('./icloud');            // createEvent({ title, start: Date, minutes, location })
+const { uploadBufferToOneDrive } = require('./onedrive'); // uploadBufferToOneDrive(Buffer, filename) => path/url
+const { startClickToCall } = require('./twilio');       // startClickToCall(number)
 
-  // español con espacios
-  if (/(\d+(?:[.,]\d+)?)\s*h(oras?)?/i.test(s)) {
-    const h = parseFloat((s.match(/(\d+(?:[.,]\d+)?)\s*h/i)||[])[1]?.replace(',','.')) || 0;
-    const m = parseInt((s.match(/(\d+)\s*m/i)||[])[1]||0);
-    return Math.round(h*60) + m;
-  }
-  if (/(\d+)\s*m(in(utos)?)?/i.test(s)) return parseInt(s.match(/(\d+)\s*m/i)[1]);
+// ---------------------- helpers ----------------------
 
-  const n = parseInt(s); // si solo hay número, asumimos minutos
-  return isNaN(n) ? 60 : n;
+function pad(n){ return String(n).padStart(2,'0'); }
+
+function toDateSafe(d) {
+  // acepta Date, dayjs, string; regresa Date o null
+  if (!d) return null;
+  if (d instanceof Date && !isNaN(d)) return d;
+  const tryDay = dayjs(d, ['YYYY-MM-DD HH:mm', 'YYYY-MM-DD', 'DD/MM/YYYY HH:mm', 'DD/MM/YYYY'], true);
+  if (tryDay.isValid()) return tryDay.toDate();
+  const asDate = new Date(d);
+  return isNaN(asDate) ? null : asDate;
 }
 
+/** Duración en minutos desde texto español/mixto */
+function parseDurationText(input) {
+  if (!input) return 60; // default
+  const s = String(input).toLowerCase().replace(/\s+/g,' ').trim();
+
+  // formatos tipo "1h30", "1:30h", "1.5h", "90m"
+  let m;
+  if ((m = s.match(/(\d+(?:[.,]\d+)?)\s*h(?:oras?)?\s*(\d+)\s*m?/))) {
+    const h = parseFloat(m[1].replace(',', '.'));
+    const min = parseInt(m[2], 10) || 0;
+    return Math.round(h*60 + min);
+  }
+  if ((m = s.match(/(\d+)\s*[:.]\s*(\d+)\s*h/))) {
+    return Math.round(parseInt(m[1],10)*60 + parseInt(m[2],10));
+  }
+  if ((m = s.match(/(\d+(?:[.,]\d+)?)\s*h(?:oras?)?/))) {
+    return Math.round(parseFloat(m[1].replace(',', '.'))*60);
+  }
+  if ((m = s.match(/(\d+)\s*m(?:in(?:utos?)?)?/))) {
+    return parseInt(m[1], 10);
+  }
+
+  // español natural
+  if (/\bmedia ?hora\b/.test(s)) return 30;
+  if (/\bhora y media\b/.test(s)) return 90;
+  if (/\buna hora\b/.test(s)) return 60;
+  if (/\bun[a]?\s*\d{0}\s*hora[s]?\b/.test(s)) return 60;
+
+  // "2 horas", "3 horas y 15"
+  if ((m = s.match(/(\d+)\s*horas?(?:\s*y\s*(\d+)\s*min)?/))) {
+    const h = parseInt(m[1],10);
+    const min = m[2] ? parseInt(m[2],10) : 0;
+    return h*60 + min;
+  }
+
+  return 60;
+}
+
+/** Extrae lugar a partir de "en <lugar>" o "@lugar" al final */
 function extractLocation(text) {
-  // "…, en Altavista", "… @Altavista"
-  let loc = null, rest = text;
-  const m1 = text.match(/(?:^|,|\s)\ben\s+([^,]+)$/i);
-  if (m1) { loc = m1[1].trim(); rest = text.replace(m1[0],'').trim(); }
-  const m2 = rest.match(/@([^\s,].*)$/);
-  if (!loc && m2) { loc = m2[1].trim(); rest = rest.replace(m2[0],'').trim(); }
-  return { location: loc, rest };
+  if (!text) return '';
+  let m = text.match(/(?:\b(?:en)\s+)([^,;]+)$/i);
+  if (m) return m[1].trim();
+  m = text.match(/@([^\s,;].*)$/);
+  if (m) return m[1].trim();
+  return '';
 }
 
-function extractDuration(text) {
-  const m = text.match(/(?:^|,|\s)(\d+(?:[.,]\d+)?\s*h(?:\s*\d+\s*m)?)\b/i)
-           || text.match(/(?:^|,|\s)(\d+\s*m)\b/i)
-           || text.match(/\b(hora y media|media hora)\b/i);
-  if (!m) return { minutes: 60, rest: text };
-  const minutes = parseDurationText(m[1] || m[0]);
-  const rest = (text.slice(0, m.index) + text.slice(m.index + m[0].length)).replace(/\s{2,}/g,' ').trim();
-  return { minutes, rest };
+/** Intenta inferir título eliminando fecha/hora/duración/lugar conocidos */
+function inferTitle(raw, { when, minutes, location }) {
+  let title = String(raw || '').trim();
+
+  // quita "en <lugar>" o "@lugar"
+  title = title
+    .replace(/\s+en\s+[^,;]+$/i, '')
+    .replace(/\s+@[^\s,;]+.*$/i, '');
+
+  // quita duración
+  title = title
+    .replace(/\b\d+\s*m(?:in(?:utos?)?)?\b/ig, '')
+    .replace(/\b\d+(?:[.,]\d+)?\s*h(?:oras?)?\b/ig, '')
+    .replace(/\bmedia ?hora\b/ig, '')
+    .replace(/\bhora y media\b/ig, '');
+
+  // quita fecha/hora reconocible simple (no perfecto, pero ayuda)
+  title = title
+    .replace(/\b(hoy|mañana|pasado mañana)\b/ig, '')
+    .replace(/\b\d{1,2}\/\d{1,2}(?:\/\d{2,4})?\b/g, '')
+    .replace(/\b\d{1,2}\s*(?:am|pm|hrs?|h)\b/ig, '')
+    .replace(/\b\d{2}:\d{2}\b/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/[,\s]+$/,'');
+
+  // si quedó vacío, título genérico
+  if (!title) title = 'Evento';
+
+  return title;
 }
 
-function parseEventFreeform(raw) {
-  // 1) quita ubicación y duración del texto
-  let { location, rest } = extractLocation(raw);
-  let dInfo = extractDuration(rest); rest = dInfo.rest;
-  let minutes = dInfo.minutes;
-
-  // 2) detecta fecha/hora con Chrono (ES)
-  const results = chrono.es.parse(rest, new Date());
-  if (!results.length) return null;
-  const r = results[0];
-  let start = r.start.date();
-
-  // si no trae hora, fija 09:00 local
-  if (start.getHours() === 0 && start.getMinutes() === 0) {
-    start.setHours(9, 0, 0, 0);
-  }
-
-  // 3) título = texto restante sin el fragmento de fecha
-  const before = rest.slice(0, r.index).trim().replace(/[,-–—]+$/,'');
-  const after  = rest.slice(r.index + r.text.length).trim().replace(/^[,-–—]+/,'');
-  const title = (before + (before && after ? ' ' : '') + after).trim() || 'Evento';
-
-  return { title, start, minutes, location };
+/** Usa chrono-node para fecha/hora en español */
+function parseWhen(text) {
+  const ref = new Date();
+  // forwardDate: fechas pasadas se mandan al futuro (siguiente ocurrencia)
+  const dt = chrono.parseDate(text, ref, { forwardDate: true });
+  return toDateSafe(dt);
 }
 
-// ---------- main ----------
-async function handleIncoming(change) {
-  const msg = change.messages?.[0];
-  const from = msg?.from;
+// ---------------------- router ----------------------
 
-  if (msg?.type === 'text') {
-    const raw = (msg.text?.body || '').trim();
+/**
+ * Maneja un mensaje entrante desde el webhook de WhatsApp.
+ * Espera un objeto `msg` similar al de Meta:
+ *  - msg.from : número del usuario
+ *  - msg.type : 'text' | 'image' | 'document' | ...
+ *  - msg.text?.body : texto
+ *  - msg.document / msg.image ... (si aplica)
+ */
+async function handleIncoming(msg) {
+  try {
+    const from = msg.from || msg.phone_number || msg.sender;
+    const body =
+      (msg.text && msg.text.body) ||
+      (msg.button && msg.button.text) ||
+      (msg.interactive && msg.interactive?.button_reply?.title) ||
+      (msg.body) ||
+      '';
 
-    // palabras clave para abrir el modo agenda
-    if (/(\bagenda\b|\bevento\b|\bcita\b)/i.test(raw)) {
-     await sendText(from, t('agenda_help'));
+    const text = String(body || '').trim();
+    const low = text.toLowerCase();
+
+    // Saludo / ayuda rápida
+    if (!text) {
+      await sendText(from, t('hello'));
       return;
     }
 
-    // intento de parseo libre
-    const ev = parseEventFreeform(raw);
-    if (ev) {
-      try {
-        const end = new Date(ev.start.getTime() + ev.minutes * 60000);
-        await createEvent({ title: ev.title, start: ev.start, end, location: ev.location });
-        await sendText(from, t('event_created', {
-  title,            // string
-  start,            // Date (si tu variable se llama startDate, usa start: startDate)
-  minutes,          // número en minutos
-  location          // string o '' si no hay
-}));
-        );
-      } catch (e) {
-        console.error(e);
-        await sendText(from, t('parse_fail_date'));
+    if (['hola','buenas','hey','menu','ayuda','help'].includes(low)) {
+      await sendText(from, t('generic_help'));
+      return;
+    }
+
+    // Intent: guía de agenda
+    if (/\bagenda\b|\bevento\b|\bcita\b/.test(low)) {
+      await sendText(from, t('agenda_help'));
+      return;
+    }
+
+    // Intent: llamada (muy básico: "llama a 555..." / "marcar 55...")
+    if (/\b(llama|marc[ae]r?)\b/.test(low)) {
+      const num = (text.match(/(\+?\d[\d\s-]{6,})/) || [])[1];
+      if (num) {
+        try {
+          await startClickToCall(num.replace(/\D/g,''));
+          await sendText(from, t('calling', num));
+        } catch (err) {
+          await sendText(from, 'No fue posible iniciar la llamada ahora mismo.');
+        }
+      } else {
+        await sendText(from, 'Indíqueme a qué número desea llamar (por ejemplo: "llama al 55 1234 5678").');
       }
       return;
     }
 
-    // fallback
-    await sendText(from, 'No entendí. Prueba: "Dentista mañana 11am 1h en Altavista" o "Café, 5/9 18:00, 30m, @Condesa".');
-    return;
-  }
+    // Intent: adjuntos -> OneDrive (si tu server ya descarga el buffer)
+    if (['image','document','audio','video'].includes(msg.type)) {
+      // Tu server debe haber puesto msg.mediaBuffer / msg.filename si ya descargó el archivo.
+      if (msg.mediaBuffer && msg.filename) {
+        try {
+          const savedPath = await uploadBufferToOneDrive(msg.mediaBuffer, msg.filename);
+          await sendText(from, t('file_saved', savedPath || msg.filename));
+        } catch (err) {
+          await sendText(from, 'No logré guardar el archivo en OneDrive en este momento.');
+        }
+      } else {
+        await sendText(from, 'Puedo guardar sus archivos en OneDrive; envíelos de nuevo y me encargo.');
+      }
+      return;
+    }
 
-  // Documento / Imagen => a OneDrive (igual que antes)
-  if (msg?.type === 'document' || msg?.type === 'image') {
-    const media = change?.messages?.[0];
-    const mediaId = media?.document?.id || media?.image?.id;
-    const filename = media?.document?.filename || `imagen-${Date.now()}.jpg`;
+    // -------- Intent: crear evento por lenguaje natural --------
+    // Ej: "Dentista mañana 11am 1h en Altavista"
+    //     "Comida, 5/9 14:00, 90m, @Roma"
+    const when = parseWhen(text);
+    if (!when) {
+      // No se detectó fecha/hora. Si el mensaje parece ser una instrucción de agenda, guía.
+      if (/\b(hoy|mañana|pasado|am|pm|\d{1,2}:\d{2}|\d{1,2}\/\d{1,2}|sept|oct|nov|dic)\b/i.test(text)) {
+        await sendText(from, t('parse_fail_date'));
+      } else {
+        await sendText(from, t('generic_help'));
+      }
+      return;
+    }
 
-    const metaUrl = `https://graph.facebook.com/v22.0/${mediaId}?access_token=${process.env.WHATSAPP_TOKEN}`;
-    const r1 = await fetch(metaUrl); const j1 = await r1.json();
-    const r2 = await fetch(j1.url);  const buf = Buffer.from(await r2.arrayBuffer());
+    const minutes = parseDurationText(text);
+    const location = extractLocation(text);
+    const title = inferTitle(text, { when, minutes, location });
 
-    const path = `/FELIX/${new Date().toISOString().slice(0,10)}/${filename}`;
-    await uploadBufferToOneDrive(path, buf);
-    await sendText(from, `Documento guardado en OneDrive: ${path}`);
-    return;
+    // Crear en iCloud (CalDAV)
+    try {
+      await createEvent({ title, start: when, minutes, location });
+      await sendText(from, t('event_created', { title, start: when, minutes, location }));
+    } catch (err) {
+      await sendText(from, 'No pude crear el evento. Intentemos otra vez en unos minutos.');
+    }
+  } catch (err) {
+    // Falla de router: que no se caiga
+    try { await sendText(msg.from, 'Ha ocurrido un detalle inesperado, pero sigo aquí.'); } catch(_) {}
   }
 }
 
