@@ -1,19 +1,25 @@
-// intentRouter.js — Router principal (ES) con tono Alfred + JARVIS
-// ---------------------------------------------------------------
-
 const dayjs = require('dayjs');
 const customParseFormat = require('dayjs/plugin/customParseFormat');
 dayjs.extend(customParseFormat);
 dayjs.locale('es');
 
 const chrono = require('chrono-node');
-
 const { t } = require('./persona');
-const { sendText } = require('./send');                 // sendText(to, body)
-const { createEvent } = require('./icloud');            // createEvent({ title, start: Date, minutes, location })
-const { uploadBufferToOneDrive } = require('./onedrive'); // uploadBufferToOneDrive(Buffer, filename) => path/url
-const { startClickToCall } = require('./twilio');       // startClickToCall(number)
 
+// Soporta export default o export nombrado en los módulos locales:
+const sendMod = require('./send');
+const sendText = sendMod.sendText || sendMod;
+
+const icloudMod = require('./icloud');
+const createEvent = icloudMod.createEvent || icloudMod;
+
+const onedriveMod = require('./onedrive');
+const uploadBufferToOneDrive = onedriveMod.uploadBufferToOneDrive || onedriveMod;
+
+const twilioMod = require('./twilio');
+const startClickToCall = twilioMod.startClickToCall || twilioMod;
+// intentRouter.js — Router principal (ES) con tono Alfred + JARVIS
+// ---------------------------------------------------------------
 // ---------------------- helpers ----------------------
 
 function pad(n){ return String(n).padStart(2,'0'); }
@@ -126,7 +132,11 @@ function parseWhen(text) {
  *  - msg.document / msg.image ... (si aplica)
  */
 async function handleIncoming(msg) {
-  try {
+  try {console.log('[webhook] incoming:', {
+  from: msg?.from || msg?.sender || msg?.phone_number,
+  type: msg?.type,
+  hasText: !!(msg?.text?.body || msg?.body)
+});
     const from = msg.from || msg.phone_number || msg.sender;
     const body =
       (msg.text && msg.text.body) ||
@@ -218,4 +228,5 @@ async function handleIncoming(msg) {
   }
 }
 
-module.exports = { handleIncoming };
+module.exports = handleIncoming;                 // soporta: require('./intentRouter')
+module.exports.handleIncoming = handleIncoming;  // soporta: const { handleIncoming } = require('./intentRouter')
