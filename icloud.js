@@ -1,4 +1,4 @@
-import * as dav from 'dav';
+const dav = require('dav');
 
 let cachedCalendar;
 
@@ -32,9 +32,18 @@ async function getCalendar() {
   return cachedCalendar;
 }
 
-export async function createEvent({ title, start, end, location }) {
+async function createEvent({ title, start, end, location }) {
   const calendar = await getCalendar();
-  const vevent = `BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:${Date.now()}@felix\nDTSTAMP:${toICS(start)}\nDTSTART:${toICS(start)}\nDTEND:${toICS(end)}\nSUMMARY:${escapeICS(title)}\n${location?`LOCATION:${escapeICS(location)}\n`:''}END:VEVENT\nEND:VCALENDAR`;
+  const vevent = `BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:${Date.now()}@felix
+DTSTAMP:${toICS(start)}
+DTSTART:${toICS(start)}
+DTEND:${toICS(end)}
+SUMMARY:${escapeICS(title)}
+${location?`LOCATION:${escapeICS(location)}\n`:''}END:VEVENT
+END:VCALENDAR`;
 
   await dav.createCalendarObject(calendar, {
     filename: `${Date.now()}.ics`,
@@ -55,3 +64,5 @@ function toICS(d){
 function escapeICS(s){
   return String(s).replace(/\n/g,'\\n').replace(/,/g,'\\,').replace(/;/g,'\\;');
 }
+
+module.exports = { createEvent };
