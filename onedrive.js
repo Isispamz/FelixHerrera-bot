@@ -1,4 +1,4 @@
-import axios from 'axios';
+const axios = require('axios');
 
 function envMS(key){ return process.env[`MS_${key}`]; }
 
@@ -14,7 +14,7 @@ async function getAccessToken() {
   return data.access_token;
 }
 
-export async function uploadBufferToOneDrive(path, buffer) {
+async function uploadBufferToOneDrive(path, buffer) {
   const token = await getAccessToken();
   const url = `https://graph.microsoft.com/v1.0/me/drive/root:${encodeURI(path)}:/content`;
   await axios.put(url, buffer, {
@@ -25,3 +25,5 @@ export async function uploadBufferToOneDrive(path, buffer) {
     maxBodyLength: Infinity
   });
 }
+
+module.exports = { uploadBufferToOneDrive };
