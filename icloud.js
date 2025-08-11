@@ -44,6 +44,44 @@ function escapeICS(s){
 }
 
 async function createEvent({ title, start, end, location }) {
+ function createEvent({ title, start, minutes = 60, location = '' }) {
+  // Normaliza 'start' a Date SIEMPRE
+  if (!(start instanceof Date)) start = new Date(start);
+  if (isNaN(start)) throw new Error('Invalid start date');
+
+  const end = new Date(start.getTime() + minutes * 60000);
+
+  // Helper para iCal UTC: YYYYMMDDTHHMMSSZ
+  const toICS = (d) =>
+    d.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+
+  // (opcional) log defensivo para ver qué llega
+  console.log('[icloud] createEvent normalized:', {
+    startISO: start.toISOString(),
+    minutes,
+    title,
+    location,
+  });
+
+  const ics = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//FelixHerreraBot//iCloud//ES',
+    'CALSCALE:GREGORIAN',
+    'BEGIN:VEVENT',
+    `UID:${Date.now()}@felixherrera-bot`,
+    `DTSTAMP:${toICS(new Date())}`,
+    `DTSTART:${toICS(start)}`,
+    `DTEND:${toICS(end)}`,
+    `SUMMARY:${title}`,
+    location ? `LOCATION:${location}` : '',
+    'END:VEVENT',
+    'END:VCALENDAR',
+    ''
+  ].filter(Boolean).join('\r\n');
+
+  // …a partir de aquí, lo que ya tenías para subir via CalDAV/dav.createCalendarObject
+}
   const xhr = getXhr();
   const calendar = await getCalendar();
   const vevent =
